@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/*.json
+logs/
+src/__pycache__/
+src/weekly_backfill.py
+run_daily.ps1
+backfill_weekly.ps1
+requirements.txt
+scripts/

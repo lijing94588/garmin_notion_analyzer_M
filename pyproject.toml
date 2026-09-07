@@ -1,0 +1,20 @@
+[project]
+name = "garmin-notion-analyzer"
+version = "0.1.0"
+description = "Fetch Garmin running data, store raw data in Notion, and write running analyses back to Notion."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "garminconnect @ git+https://github.com/cyberjunky/python-garminconnect.git",
+    "curl-cffi>=0.15.0",
+    "requests>=2.33.0",
+    "python-dotenv>=1.0.1",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+]
+
+[project.scripts]
+garmin-sync = "src.main:run"
+
+[tool.uv]
+package = false
