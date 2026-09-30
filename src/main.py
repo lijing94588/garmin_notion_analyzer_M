@@ -163,8 +163,87 @@ def garmin_pause():
     if high < low: low, high = high, low
     time.sleep(random.randint(low, high))
 
+def _d1_config():
+    return {
+        "account_id": os.getenv("CLOUDFLARE_ACCOUNT_ID"),
+        "api_token": os.getenv("CLOUDFLARE_API_TOKEN"),
+        "database_id": os.getenv("CLOUDFLARE_D1_DATABASE_ID"),
+    }
+
+
+def execute_d1_query(sql: str, params: list | None = None) -> dict | None:
+    """
+    透過Cloudflare D1的HTTP API執行SQL。跟 garmin-to-Notion-New 共用同一個D1資料庫，
+    這樣兩個repo才能共用同一份Garmin token，不用手動同步。
+    D1寫入/讀取失敗都只印警告、回傳None，不會讓主流程中斷。
+    """
+    config = _d1_config()
+    account_id, api_token, database_id = config["account_id"], config["api_token"], config["database_id"]
+
+    if not all([account_id, api_token, database_id]):
+        print("Warning: Cloudflare D1 環境變數未設定齊全，跳過D1操作。")
+        return None
+
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{database_id}/query"
+    headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
+    body = {"sql": sql, "params": params or []}
+
+    try:
+        response = requests.post(url, headers=headers, json=body, timeout=15)
+        response.raise_for_status()
+        result = response.json()
+        if not result.get("success"):
+            print(f"Warning: D1操作失敗: {result}")
+            return None
+        return result
+    except Exception as e:
+        print(f"Warning: D1操作時發生例外: {e}")
+        return None
+
+
+def get_token_from_d1() -> str | None:
+    try:
+        sql = "SELECT value FROM credentials WHERE key = ?"
+        result = execute_d1_query(sql, ["garmin_auth_token"])
+        if not result:
+            return None
+        rows = (result.get('result') or [{}])[0].get('results', [])
+        if rows and rows[0].get('value'):
+            return rows[0]['value']
+        return None
+    except Exception as e:
+        print(f"Warning: 無法從D1讀取Garmin token: {e}")
+        return None
+
+
+def write_token_to_d1(garmin_client) -> None:
+    try:
+        token_str = garmin_client.client.dumps()
+        sql = """
+            INSERT OR REPLACE INTO credentials (key, value, updated_at)
+            VALUES (?, ?, ?)
+        """
+        params = ["garmin_auth_token", token_str, datetime.now(ZoneInfo("UTC")).isoformat()]
+        result = execute_d1_query(sql, params)
+        if result:
+            print("已將更新後的Garmin token寫回D1。")
+    except Exception as e:
+        print(f"Warning: 無法將更新後的Garmin token寫回D1: {e}")
+
+
 def seed_tokenstore_from_env(tokenstore):
-    token_json = os.getenv("GARMIN_TOKEN_JSON", "").strip()
+    """
+    寫入本地tokenstore用的token內容，優先來源是D1(跟garmin-to-Notion-New共用)，
+    D1讀不到才退回用 GARMIN_AUTH_TOKEN 這個環境變數(原本叫GARMIN_TOKEN_JSON，已改名跟另一個repo統一)。
+    """
+    token_json = get_token_from_d1()
+    if token_json:
+        print("使用D1裡的最新Garmin token。")
+    else:
+        token_json = os.getenv("GARMIN_AUTH_TOKEN", "").strip()
+        if token_json:
+            print("D1沒有資料或無法連線，改用 GARMIN_AUTH_TOKEN 環境變數當作起始值。")
+
     if not token_json:
         return
     try:
@@ -172,7 +251,7 @@ def seed_tokenstore_from_env(tokenstore):
         if not isinstance(parsed, dict):
             raise ValueError("token JSON 必須是 object")
     except json.JSONDecodeError as exc:
-        raise RuntimeError("GARMIN_TOKEN_JSON 不是有效 JSON；請使用單行壓縮 JSON，並確認 .env 沒有未跳脫的換行") from exc
+        raise RuntimeError("GARMIN_AUTH_TOKEN 不是有效 JSON；請使用單行壓縮 JSON，並確認 .env 沒有未跳脫的換行") from exc
     token_dir = Path(tokenstore)
     token_dir.mkdir(parents=True, exist_ok=True)
     token_file = token_dir / "garmin_tokens.json"
@@ -181,7 +260,7 @@ def seed_tokenstore_from_env(tokenstore):
         os.chmod(token_file, 0o600)
     except OSError:
         pass
-    print(f"已將 GARMIN_TOKEN_JSON 寫入本地 tokenstore：{token_file}")
+    print(f"已將 GARMIN_AUTH_TOKEN 寫入本地 tokenstore：{token_file}")
 
 def init_garmin():
     tokenstore_value = os.getenv("GARMINTOKENS", "~/.garminconnect")
@@ -191,6 +270,7 @@ def init_garmin():
         g = Garmin()
         g.login(tokenstore)
         print(f"Garmin 已使用本地 token 登入：{tokenstore}")
+        write_token_to_d1(g)
         return g
     except GarminConnectTooManyRequestsError as exc:
         raise RuntimeError("Garmin token 恢復或登入被 HTTP 429 限流。請停止重試，等待數小時至 24 小時後再試。") from exc
@@ -205,6 +285,7 @@ def init_garmin():
         g = Garmin(email=email, password=password)
         g.login(tokenstore)
         print(f"Garmin 完整登入成功，token 已保存至：{tokenstore}")
+        write_token_to_d1(g)
         return g
     except Exception as exc:
         if "429" in str(exc) or "TooManyRequests" in str(exc) or "rate limited" in str(exc).lower():
