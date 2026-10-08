@@ -6,6 +6,8 @@ data/*.json
 logs/
 src/__pycache__/
 src/weekly_backfill.py
+src/backfill_d1_progress.py
+src/verufy_d1.py
 run_daily.ps1
 backfill_weekly.ps1
 requirements.txt

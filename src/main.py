@@ -163,43 +163,111 @@ def garmin_pause():
     if high < low: low, high = high, low
     time.sleep(random.randint(low, high))
 
+
 def _d1_config():
-    return {
-        "account_id": os.getenv("CLOUDFLARE_ACCOUNT_ID"),
-        "api_token": os.getenv("CLOUDFLARE_API_TOKEN"),
-        "database_id": os.getenv("CLOUDFLARE_D1_DATABASE_ID"),
-    }
+    return {"account_id": os.getenv("CLOUDFLARE_ACCOUNT_ID"), "api_token": os.getenv("CLOUDFLARE_API_TOKEN"), "database_id": os.getenv("CLOUDFLARE_D1_DATABASE_ID")}
 
+D1_SCHEMA_STATEMENTS = [
+    """CREATE TABLE IF NOT EXISTS garmin_raw_activities (activity_id TEXT PRIMARY KEY, name TEXT, start_date TEXT, activity_type TEXT, distance_km REAL, duration_min REAL, avg_hr REAL, avg_pace_min_km REAL, raw_synced INTEGER, raw_json_hash TEXT, raw_json TEXT, synced_at TEXT NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS garmin_raw_laps (activity_id TEXT NOT NULL, lap_index INTEGER NOT NULL, lap_date TEXT, distance_m REAL, duration_sec REAL, avg_speed_m_s REAL, avg_hr REAL, cadence REAL, power_w REAL, ground_contact_ms REAL, stride_m REAL, vertical_osc_cm REAL, raw_json TEXT, synced_at TEXT NOT NULL, PRIMARY KEY (activity_id, lap_index))""",
+    """CREATE TABLE IF NOT EXISTS garmin_raw_detail_json (activity_id TEXT PRIMARY KEY, start_date TEXT, measurement_count INTEGER, metrics_count INTEGER, raw_json_hash TEXT, raw_json TEXT, synced_at TEXT NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS garmin_running_analysis (activity_id TEXT PRIMARY KEY, name TEXT, date TEXT, activity_type TEXT, duration_min REAL, distance_km REAL, pace_min_km REAL, pace_cv_pct REAL, pace_range_pct REAL, half_split_diff_pct REAL, mrs_pct REAL, avg_hr REAL, hr_drift_pct REAL, hr_decoupling_pct REAL, garmin_rpe REAL, trimp REAL, srpe_load REAL, load_7d REAL, load_28d REAL, cadence_change_pct REAL, gct_change_pct REAL, power_w_kg REAL, temperature_c REAL, training_load REAL, body_battery_diff REAL, notes TEXT, synced_at TEXT NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS garmin_weekly_running_analysis (week_key TEXT PRIMARY KEY, name TEXT, week_start TEXT, week_end TEXT, training_sessions REAL, training_frequency_cv REAL, training_frequency_class TEXT, distance_km REAL, duration_min REAL, training_load REAL, srpe_load REAL, avg_hr REAL, avg_pace_min_km REAL, hr_efficiency_slope REAL, hr_efficiency_trend TEXT, recovery_burden_ratio REAL, recovery_burden_change REAL, recovery_resilience_trend TEXT, mrs_avg_pct REAL, hr_drift_avg_pct REAL, hr_decoupling_avg_pct REAL, temperature_avg_c REAL, notes TEXT, synced_at TEXT NOT NULL)""",
+    "CREATE INDEX IF NOT EXISTS idx_garmin_raw_activities_date ON garmin_raw_activities(start_date)",
+    "CREATE INDEX IF NOT EXISTS idx_garmin_raw_laps_activity ON garmin_raw_laps(activity_id)",
+    "CREATE INDEX IF NOT EXISTS idx_garmin_raw_detail_date ON garmin_raw_detail_json(start_date)",
+    "CREATE INDEX IF NOT EXISTS idx_garmin_analysis_date ON garmin_running_analysis(date)",
+    "CREATE INDEX IF NOT EXISTS idx_garmin_weekly_start ON garmin_weekly_running_analysis(week_start)",
+]
 
-def execute_d1_query(sql: str, params: list | None = None) -> dict | None:
-    """
-    透過Cloudflare D1的HTTP API執行SQL。跟 garmin-to-Notion-New 共用同一個D1資料庫，
-    這樣兩個repo才能共用同一份Garmin token，不用手動同步。
-    D1寫入/讀取失敗都只印警告、回傳None，不會讓主流程中斷。
-    """
-    config = _d1_config()
-    account_id, api_token, database_id = config["account_id"], config["api_token"], config["database_id"]
-
-    if not all([account_id, api_token, database_id]):
-        print("Warning: Cloudflare D1 環境變數未設定齊全，跳過D1操作。")
-        return None
-
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{database_id}/query"
-    headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
-    body = {"sql": sql, "params": params or []}
-
+def execute_d1_query(sql: str, params=None):
+    c=_d1_config();
+    if not all(c.values()):
+        print("Warning: Cloudflare D1 環境變數未設定齊全，跳過 D1 操作。", flush=True); return None
+    url=f"https://api.cloudflare.com/client/v4/accounts/{c['account_id']}/d1/database/{c['database_id']}/query"
     try:
-        response = requests.post(url, headers=headers, json=body, timeout=15)
-        response.raise_for_status()
-        result = response.json()
+        r=requests.post(url, headers={"Authorization":f"Bearer {c['api_token']}","Content-Type":"application/json"}, json={"sql":sql,"params":params or []}, timeout=30)
+        r.raise_for_status(); result=r.json()
         if not result.get("success"):
-            print(f"Warning: D1操作失敗: {result}")
+            print(f"Warning: D1 操作失敗: {result}", flush=True)
+            if os.getenv("D1_STRICT_SYNC","false").lower()=="true": raise RuntimeError(str(result))
             return None
         return result
     except Exception as e:
-        print(f"Warning: D1操作時發生例外: {e}")
+        print(f"Warning: D1 操作時發生例外: {e}", flush=True)
+        if os.getenv("D1_STRICT_SYNC","false").lower()=="true": raise
         return None
 
+def ensure_d1_schema():
+    if not all(_d1_config().values()): return False
+    for sql in D1_SCHEMA_STATEMENTS: execute_d1_query(sql)
+    return True
+
+def _d1_now(): return datetime.now(ZoneInfo("UTC")).isoformat()
+def _d1_json(obj): return json.dumps(obj, ensure_ascii=False, separators=(",",":"), default=str)
+
+def _d1_upsert(table, columns, values, keys):
+    ph=','.join('?' for _ in columns); updates=','.join(f'{c}=excluded.{c}' for c in columns if c not in keys)
+    sql=f"INSERT INTO {table} ({','.join(columns)}) VALUES ({ph}) ON CONFLICT ({','.join(keys)}) DO UPDATE SET {updates}"
+    return execute_d1_query(sql, values)
+
+def d1_sync_activity(a, splits, details, raw_bundle):
+    # lap_date 使用 Activity 本身的 startTimeLocal；
+    # Garmin lapDTO 通常不提供 startTimeLocal，因此不能從 lap 物件取日期。
+
+    aid=str(getv(a,'activityId')); raw=_d1_json(a); h=hashlib.sha256(raw.encode()).hexdigest(); st=str(getv(a,'startTimeLocal',default=''))[:10]
+    _d1_upsert('garmin_raw_activities', ['activity_id','name','start_date','activity_type','distance_km','duration_min','avg_hr','avg_pace_min_km','raw_synced','raw_json_hash','raw_json','synced_at'], [aid,getv(a,'activityName',default=aid),st,activity_category(a),(safe_float(getv(a,'distance',default=0)) or 0)/1000,(safe_float(getv(a,'duration',default=0)) or 0)/60,safe_float(getv(a,'averageHR')),pace(safe_float(getv(a,'averageSpeed'))),1,h,raw,_d1_now()], ['activity_id'])
+    for i,lap in enumerate(splits,1):
+        _d1_upsert('garmin_raw_laps',['activity_id','lap_index','lap_date','distance_m','duration_sec','avg_speed_m_s','avg_hr','cadence','power_w','ground_contact_ms','stride_m','vertical_osc_cm','raw_json','synced_at'],[aid,i,st,safe_float(getv(lap,'distance')),safe_float(getv(lap,'duration')),safe_float(getv(lap,'averageSpeed')),safe_float(getv(lap,'averageHR')),safe_float(getv(lap,'averageRunCadence')),safe_float(getv(lap,'averagePower')),safe_float(getv(lap,'groundContactTime')),safe_float(getv(lap,'strideLength')),safe_float(getv(lap,'verticalOscillation')),_d1_json(lap),_d1_now()],['activity_id','lap_index'])
+    bundle=_d1_json(raw_bundle); bh=hashlib.sha256(bundle.encode()).hexdigest()
+    _d1_upsert('garmin_raw_detail_json',['activity_id','start_date','measurement_count','metrics_count','raw_json_hash','raw_json','synced_at'],[aid,st,safe_float(details.get('measurementCount')),safe_float(details.get('metricsCount')),bh,bundle,_d1_now()],['activity_id'])
+
+def d1_upsert_analysis(result):
+    cols=['activity_id','name','date','activity_type','duration_min','distance_km','pace_min_km','pace_cv_pct','pace_range_pct','half_split_diff_pct','mrs_pct','avg_hr','hr_drift_pct','hr_decoupling_pct','garmin_rpe','trimp','srpe_load','load_7d','load_28d','cadence_change_pct','gct_change_pct','power_w_kg','temperature_c','training_load','body_battery_diff','notes','synced_at']
+    vals=[result.get('Activity ID'),result.get('Name'),result.get('Date'),result.get('Activity Type'),result.get('Duration min'),result.get('Distance km'),result.get('Pace min/km'),result.get('Pace CV %'),result.get('Pace Range %'),result.get('Half Split Diff %'),result.get('MRS %'),result.get('Avg HR'),result.get('HR Drift %'),result.get('HR Decoupling %'),result.get('Garmin RPE'),result.get('TRIMP'),result.get('sRPE Load'),result.get('7d Load'),result.get('28d Load'),result.get('Cadence Change %'),result.get('GCT Change %'),result.get('Power W/kg'),result.get('Temperature C'),result.get('Training Load'),result.get('Body Battery Diff'),result.get('Notes'),_d1_now()]
+    return _d1_upsert('garmin_running_analysis',cols,vals,['activity_id'])
+
+def d1_upsert_weekly(row):
+    cols=['week_key','name','week_start','week_end','training_sessions','training_frequency_cv','training_frequency_class','distance_km','duration_min','training_load','srpe_load','avg_hr','avg_pace_min_km','hr_efficiency_slope','hr_efficiency_trend','recovery_burden_ratio','recovery_burden_change','recovery_resilience_trend','mrs_avg_pct','hr_drift_avg_pct','hr_decoupling_avg_pct','temperature_avg_c','notes','synced_at']
+    vals=[row.get(c) for c in cols[:-1]]+[_d1_now()]
+    return _d1_upsert('garmin_weekly_running_analysis',cols,vals,['week_key'])
+
+def d1_rebuild_weekly():
+    r=execute_d1_query('SELECT date,activity_type,distance_km,duration_min,pace_min_km,avg_hr,hr_drift_pct,hr_decoupling_pct,mrs_pct,training_load,srpe_load,body_battery_diff,temperature_c FROM garmin_running_analysis ORDER BY date')
+    rows=(r.get('result') or [{}])[0].get('results',[]) if r else []
+    rec=[]
+    for x in rows:
+        try: d=date.fromisoformat(str(x.get('date'))[:10])
+        except: continue
+        if x.get('activity_type') not in (None,'running','treadmill'): continue
+        rec.append({'Date':d,**x})
+    if not rec: return
+    df=pd.DataFrame(rec); df['week_start']=[d-timedelta(days=d.weekday()) for d in df['Date']]
+    g=[]
+    for ws,x in df.groupby('week_start',sort=True):
+        tl=pd.to_numeric(x['training_load'],errors='coerce').sum(min_count=1); bb=pd.to_numeric(-x['body_battery_diff'],errors='coerce').sum(min_count=1)
+        g.append({'week_start':ws,'week_end':ws+timedelta(days=6),'sessions':len(x),'distance':pd.to_numeric(x.distance_km,errors='coerce').sum(min_count=1),'duration':pd.to_numeric(x.duration_min,errors='coerce').sum(min_count=1),'training_load':tl,'srpe_load':pd.to_numeric(x.srpe_load,errors='coerce').sum(min_count=1),'avg_hr':pd.to_numeric(x.avg_hr,errors='coerce').mean(),'avg_pace':pd.to_numeric(x.pace_min_km,errors='coerce').mean(),'mrs':pd.to_numeric(x.mrs_pct,errors='coerce').mean(),'hr_drift':pd.to_numeric(x.hr_drift_pct,errors='coerce').mean(),'hr_decoupling':pd.to_numeric(x.hr_decoupling_pct,errors='coerce').mean(),'temperature':pd.to_numeric(x.temperature_c,errors='coerce').mean(),'recovery_ratio':(bb/tl if pd.notna(tl) and tl!=0 else None)})
+    w=pd.DataFrame(g).sort_values('week_start').reset_index(drop=True)
+    idx=list(pd.date_range(w.week_start.min(),w.week_start.max(),freq='7D').date); w=w.set_index('week_start').reindex(idx).rename_axis('week_start').reset_index(); w['week_end']=[d+timedelta(days=6) for d in w.week_start]
+    for c in ['sessions','distance','duration','training_load','srpe_load']: w[c]=w[c].fillna(0)
+    for i,row in w.iterrows():
+        counts=[float(w.loc[j,'sessions']) for j in range(max(0,i-3),i+1)]; mean=float(np.mean(counts)); cv=float(np.std(counts,ddof=0)/mean) if mean else None
+        eff=[]
+        for j in range(max(0,i-5),i+1):
+            p,h=w.loc[j,'avg_pace'],w.loc[j,'avg_hr']
+            if pd.notna(p) and pd.notna(h) and p>0 and h>0: eff.append(1000/(float(p)*60)/float(h))
+        slope=linear_slope(eff); recent=w.loc[max(0,i-2):i,'recovery_ratio'].dropna().tolist(); early=w.loc[max(0,i-5):max(0,i-3),'recovery_ratio'].dropna().tolist() if i>=3 else []; rm=float(np.mean(recent)) if recent else None; em=float(np.mean(early)) if early else None; change=rm-em if rm is not None and em is not None else None
+        notes=[]
+        if len(counts)<4: notes.append('訓練頻率CV目前少於4週，先視為初步值')
+        if len(early)<1: notes.append('恢復負擔比變化需至少4週資料')
+        wk=row.week_start.isoformat()
+        d1_upsert_weekly({'week_key':wk,'name':f'Week {wk}','week_start':wk,'week_end':row.week_end.isoformat(),'training_sessions':row.sessions,'training_frequency_cv':cv,'training_frequency_class':classify_frequency(cv),'distance_km':row.distance,'duration_min':row.duration,'training_load':row.training_load,'srpe_load':row.srpe_load,'avg_hr':row.avg_hr,'avg_pace_min_km':row.avg_pace,'hr_efficiency_slope':slope,'hr_efficiency_trend':classify_efficiency(slope),'recovery_burden_ratio':row.recovery_ratio,'recovery_burden_change':change,'recovery_resilience_trend':classify_recovery(change),'mrs_avg_pct':row.mrs,'hr_drift_avg_pct':row.hr_drift,'hr_decoupling_avg_pct':row.hr_decoupling,'temperature_avg_c':row.temperature,'notes':'；'.join(notes) or '週彙總資料完整'})
+
+def d1_table_counts():
+    out={}
+    for t in ['garmin_raw_activities','garmin_raw_laps','garmin_raw_detail_json','garmin_running_analysis','garmin_weekly_running_analysis']:
+        r=execute_d1_query(f'SELECT COUNT(*) AS n FROM {t}'); rr=(r.get('result') or [{}])[0].get('results',[]) if r else []; out[t]=rr[0]['n'] if rr else None
+    return out
 
 def get_token_from_d1() -> str | None:
     try:
@@ -572,7 +640,7 @@ def run():
         raise ValueError(f"日期格式錯誤：START_DATE={start_text!r}, END_DATE={end_text!r}；請使用 YYYY-MM-DD，例如 2026-06-01") from exc
     if start > end:
         raise ValueError(f"日期範圍錯誤：START_DATE {start} 晚於 END_DATE {end}")
-    db=ensure_databases(); g, acts=fetch_garmin(start,end)
+    db=ensure_databases(); ensure_d1_schema(); g, acts=fetch_garmin(start,end)
     print(f"符合跑步條件的活動：{len(acts)} 筆。接下來每筆 detail 與 splits 請求前會等待 30–45 秒。", flush=True)
     all_analysis=[]
     for index, a in enumerate(acts, 1):
@@ -605,6 +673,7 @@ def run():
             upsert_raw_detail(db["samples"], sample_props, raw_bundle)
         else:
             ppage(db["samples"], sample_props, unique_prop="Activity ID", unique_value=aid)
+        d1_sync_activity(a, splits, details, raw_bundle)
         result=analyse(a,splits,details); all_analysis.append(result)
         print(f"[{index}/{len(acts)}] 欄位診斷：Garmin RPE={'有' if result.get('Garmin RPE') is not None else '無'}；Temperature C={'有' if result.get('Temperature C') is not None else '無'}；Power W/kg={'有' if result.get('Power W/kg') is not None else '無'}。", flush=True)
         print(f"[{index}/{len(acts)}] Activity ID {aid} 已完成並寫入 raw data。", flush=True)
@@ -619,10 +688,13 @@ def run():
         aid=result["Activity ID"]
         props={k:(date_prop(v) if k=="Date" else rich(v) if k in ("Activity ID","Notes") else select(v) if k=="Activity Type" else num(v)) for k,v in result.items() if k!="Name"}
         ppage(db["analysis"],{"Name":f"{aid}-analysis", **props}, unique_prop="Activity ID", unique_value=aid)
+        d1_upsert_analysis(result)
+    d1_rebuild_weekly()
     if db.get("weekly"):
         sync_weekly(db["analysis"], db["weekly"])
     else:
         print("未設定 NOTION_WEEKLY_DB_ID，略過每週彙總。", flush=True)
     print(f"完成：{len(acts)} 筆跑步活動，日期 {start} 至 {end}；原始資料已先寫入 Notion，再寫入分析結果。")
+    if all(_d1_config().values()): print("D1 備份筆數：", d1_table_counts(), flush=True)
 
 if __name__=="__main__": run()
