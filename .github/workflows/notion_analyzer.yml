@@ -2,8 +2,8 @@ name: Garmin Notion Analyzer
 
 on:
   schedule:
-    # GitHub Actions 目前支援 IANA timezone；每天台灣時間 20:00 執行。
-    - cron: "0 20 * * *"
+    # GitHub Actions 目前支援 IANA timezone；每天台灣時間 21:00 執行。
+    - cron: "0 13 * * *" # UTC time, which is 21:00 Taipei time
       timezone: "Asia/Taipei"
   workflow_dispatch:
 
@@ -39,8 +39,8 @@ jobs:
       NOTION_RAW_DETAIL_DB_ID: ${{ secrets.NOTION_RAW_DETAIL_DB_ID }}
       NOTION_ANALYSIS_DB_ID: ${{ secrets.NOTION_ANALYSIS_DB_ID }}
       NOTION_WEEKLY_DB_ID: ${{ secrets.NOTION_WEEKLY_DB_ID }}
-      GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
-      GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+      #GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
+      #GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
       # 已由 GARMIN_TOKEN_JSON 改名為 GARMIN_AUTH_TOKEN，跟 garmin-to-Notion-New 統一命名。
       # 現在只在D1的credentials表是空的時候(例如第一次執行)當作起始值，
       # 平常執行時 main.py 會優先讀取D1裡兩個repo共用的最新token，登入後再寫回D1。
